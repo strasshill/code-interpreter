@@ -79,3 +79,11 @@ jobs:
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+      - name: Publish package visibility
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh api --method PATCH
+          "/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/codeapi-${{ matrix.name }}"
+          -f visibility=public
