@@ -10,7 +10,10 @@ import {
   createBridgeIdentity,
   signBridgeRequest,
 } from '../../../packages/code/src/identity';
-import { BRIDGE_PROTOCOL_VERSION } from '../../../packages/code/src/protocol';
+import {
+  BRIDGE_PROTOCOL_VERSION,
+  BRIDGE_WORKSPACE_COMMAND_MAX_TIMEOUT_MS,
+} from '../../../packages/code/src/protocol';
 import { RedisBridgePairingStore } from './pairing';
 import { createBridgeRouter } from './router';
 import { RedisBridgeStore } from './store';
@@ -25,6 +28,23 @@ afterEach(async () => {
 });
 
 describe('paired bridge HTTP API', () => {
+  test('disabled bridges expose no HTTP routes', async () => {
+    const app = express();
+    app.use('/v1/bridge', createBridgeRouter({
+      enabled: false,
+      store: new RedisBridgeStore(redis),
+      pairings: new RedisBridgePairingStore(redis),
+      authMode: 'static',
+      adminToken: '',
+    }));
+    server = createServer(app);
+    await new Promise<void>((resolve) => server?.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (address == null || typeof address === 'string') throw new Error('Expected TCP listener');
+    const response = await fetch(`http://127.0.0.1:${address.port}/v1/bridge/workers/test/status`);
+    expect(response.status).toBe(404);
+  });
+
   test('reports authenticated worker readiness without exposing identity or binding data', async () => {
     const store = new RedisBridgeStore(redis);
     const app = express();
@@ -96,6 +116,55 @@ describe('paired bridge HTTP API', () => {
 
     const unauthorized = await fetch(`${baseUrl}/workers/user-vm/status`);
     expect(unauthorized.status).toBe(401);
+  });
+
+  test('advertises the effective server command timeout for command-capable workers', async () => {
+    const store = new RedisBridgeStore(redis);
+    const app = express();
+    app.use(json());
+    app.use(
+      '/v1/bridge',
+      createBridgeRouter({
+        store,
+        pairings: new RedisBridgePairingStore(redis),
+        authMode: 'static',
+        adminToken: 'strong-administrator-bootstrap-token',
+        configuredWorkerId: 'command-worker',
+        maxCommandTimeoutMs: 900_000,
+      }),
+    );
+    server = createServer(app);
+    await new Promise<void>((resolve) => server?.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (address == null || typeof address === 'string') {
+      throw new Error('Expected TCP listener');
+    }
+    await store.register({
+      protocolVersion: BRIDGE_PROTOCOL_VERSION,
+      workerId: 'command-worker',
+      incarnationId: 'incarnation-00000001',
+      capabilities: {
+        statefulWorkspace: false,
+        sandboxProfile: 'native-srt',
+        runtimes: [],
+        workspaceTools: {
+          protocolVersion: BRIDGE_PROTOCOL_VERSION,
+          operations: ['execute_command'],
+          workspaces: [{ id: 'primary' }],
+        },
+      },
+    });
+
+    const response = await fetch(
+      `http://127.0.0.1:${address.port}/v1/bridge/workers/command-worker/status`,
+      { headers: { Authorization: 'Bearer strong-administrator-bootstrap-token' } },
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      workerId: 'command-worker',
+      maxCommandTimeoutMs: BRIDGE_WORKSPACE_COMMAND_MAX_TIMEOUT_MS,
+    });
   });
 
   test('rejects a malformed optional binding for a configured worker', async () => {

@@ -38,6 +38,8 @@ export interface BuildReplayExecutionStateParams {
   timeout: number;
   language: 'python' | 'bash';
   bridgeWorkerId?: string;
+  workspaceId?: string;
+  workspaceInstanceId?: string;
   sandboxBackend?: SandboxBackendName;
   executionProfile: ExecutionProfile;
   executionProfileSource: ExecutionProfileSource;
@@ -66,6 +68,8 @@ export function buildReplayExecutionState(
     authContextHash: identity.authContextHash,
     apiKeyId: params.apiKeyId,
     bridgeWorkerId: params.bridgeWorkerId,
+    workspaceId: params.workspaceId,
+    workspaceInstanceId: params.workspaceInstanceId,
     sandboxBackend: params.sandboxBackend,
     executionProfile: params.executionProfile,
     executionProfileSource: params.executionProfileSource,
@@ -80,4 +84,14 @@ export function buildReplayExecutionState(
     callCount: 0,
     language: params.language,
   };
+}
+
+/** Bind the authenticated conversation checkout to every replay iteration. */
+export function bindReplayWorkspaceInstance(
+  payload: t.PayloadBody,
+  state: Pick<ExecutionState, 'workspaceInstanceId'>,
+): t.PayloadBody {
+  return state.workspaceInstanceId == null
+    ? payload
+    : { ...payload, workspace_instance_id: state.workspaceInstanceId };
 }

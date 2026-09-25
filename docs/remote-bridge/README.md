@@ -3,6 +3,10 @@
 Remote Code Bridge makes an operator-owned VM a stateful Code API execution
 environment without exposing that VM to inbound internet traffic.
 
+For an end-to-end host setup, including pairing, named environments, systemd,
+launchd, GitHub App credentials, upgrades, verification, and recovery, see the
+[self-hosted worker runbook](./worker-runbook.md).
+
 ```text
 LibreChat -> Code API -> Redis assignment
                          ^             |
@@ -149,6 +153,17 @@ implementation and an allowlist of workspace IDs, preserves per-workspace
 operation restrictions, validates bounded results, and treats an unknown
 command failure as an uncertain mutation.
 
+Selected attached workspaces on macOS, Linux, and WSL2 can also advertise Bash
+Programmatic Tool Calling. Native Windows workers do not advertise Bash PTC.
+Code API then runs each replay iteration through the same workspace-scoped
+native SRT executor. Source code operates in the selected local root, while
+replay metadata, injected skills and attachments, and generated artifacts are
+staged in an execution-private data directory and removed after settlement.
+Only authorized file references and returned artifacts cross the relay; the
+repository is never uploaded to Code API. This capability is advertised only
+when native SRT commands and a file-relay upstream are both configured, so
+older or partially configured workers continue to fail closed.
+
 Native SRT is the MVP and default command backend on a user's chosen laptop or
 VM. It uses Seatbelt on macOS, bubblewrap/seccomp on Linux, and the SRT
 restricted-account helper on Windows. It confines writes to the registered
@@ -157,9 +172,11 @@ credentials, and denies network egress by default. Startup fails closed when
 the platform dependencies are unavailable; there is no unsandboxed fallback.
 Use `LIBRECHAT_CODE_COMMAND_ALLOWED_DOMAINS` for an explicit comma-separated
 egress allowlist.
-Linux hosts must provide Bash at `/bin/bash`, `bubblewrap`, `socat`, and
-`ripgrep`; macOS uses system facilities. Windows requires SRT's one-time
-restricted-account setup.
+Linux hosts must provide `bubblewrap`, `socat`, and `ripgrep`; macOS uses
+system facilities. Bash Programmatic Tool Calling additionally requires Bash
+5.2 or newer and `jq` on `PATH` on macOS, Linux, and WSL2. The worker resolves
+the compatible shell from `PATH` rather than assuming `/bin/bash`. Windows
+requires SRT's one-time restricted-account setup.
 
 The optional `docker-nsjail` adapter enables a stronger container boundary with
 `--allow-workspace-commands` (or
@@ -187,6 +204,7 @@ Expose the Code API deployment as an environment under the Agents endpoint:
 endpoints:
     agents:
         statefulCodeSessions:
+            allowedEnvironments: [user, agent-user, conversation]
             environments:
                 - id: my-vm
                   name: My VM
@@ -217,7 +235,10 @@ execution.
 - Remote bridge deployments use backend-specific BullMQ queues and serialize
   the expected backend on every new job, preventing Lambda or HTTP consumers
   from accepting attached-worker executions.
-- Code API permits one active assignment per worker.
+- Code API negotiates a bounded number of active workspace assignments per
+  worker. The lower API or worker slot ceiling wins, and assignments sharing
+  the same workspace isolation key remain serialized while independent
+  conversation worktrees may run concurrently.
 - Dynamic workers are fenced to their server-issued tenant before assignment.
 - Each assignment has an absolute deadline, generation, and random lease token.
 - Settlements with the wrong worker, generation, token, or expired deadline are
@@ -243,6 +264,23 @@ execution.
   the currently registered incarnation.
 - Request cancellation is polled by the worker and aborts the local sandbox
   request.
+- Replay PTC clients may attach a fresh `X-LibreChat-Code-Request-ID` to each
+  `/exec/programmatic` request and send that same opaque ID to
+  `POST /v1/exec/programmatic/cancel`. Code API binds the short-lived request
+  record to the authenticated principal, durably marks cancellation in Redis,
+  and publishes it to the worker process holding the BullMQ job. This explicit
+  path avoids relying on HTTP connection teardown, frees waiting jobs
+  immediately, and interrupts active remote-bridge assignments without polling
+  once per active job.
+  Cancellation and completed-result publication use an atomic Redis decision:
+  a late cancel returns `already_completed` instead of acknowledging Stop after
+  completion won. Ambiguous enqueue/cancellation errors retain replay ownership
+  until a durable fence or the original job deadline. Completed results are
+  retained temporarily (bounded to 16 MiB) so a lost BullMQ completion reply
+  does not cause sandbox effects to be repeated. Reconnect reconciliation reads
+  only small status markers, using one subscriber per process.
+  Roll out the matching Code API queue-worker processes before enabling this
+  endpoint on API replicas; pre-cancellation workers do not observe its markers.
 - A leased assignment remains in a Redis-backed delivery claim until the worker
   explicitly acknowledges it; reconnecting before acknowledgement redelivers
   the same fenced assignment instead of losing it after an HTTP disconnect.

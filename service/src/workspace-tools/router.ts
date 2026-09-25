@@ -3,17 +3,22 @@ import { Router } from 'express';
 import type { RequestHandler, Response } from 'express';
 import type { AuthenticatedRequest } from '../types';
 import type { RedisBridgeStore } from '../bridge/store';
+import type { WorkspaceToolRequest } from '../../../packages/code/src/protocol';
 
 import { getWorkspaceToolOutcome } from './outcome';
 import { getPrincipalOrReject } from '../auth/principal';
 import { BridgeStoreError } from '../bridge/store';
 import { checkServiceShutDown } from '../lifecycle';
-import { isWorkspaceToolRequest } from '../../../packages/code/src/protocol';
+import {
+  isWorkspaceToolRequest,
+  BRIDGE_WORKSPACE_COMMAND_DEFAULT_TIMEOUT_MS,
+} from '../../../packages/code/src/protocol';
 import {
   CODEAPI_BRIDGE_WORKER_HEADER,
   BridgeWorkerSelectionError,
   resolveBridgeWorkerSelection,
 } from '../bridge/selection';
+import { principalWorkspaceInstanceId } from '../bridge/workspace-instance';
 
 interface WorkspaceToolsRouterOptions {
   store: Pick<RedisBridgeStore, 'dispatchWorkspaceTool'>;
@@ -21,6 +26,7 @@ interface WorkspaceToolsRouterOptions {
   configuredWorkerId: string;
   dynamicWorkers: boolean;
   timeoutMs?: number;
+  queueTimeoutMs?: number;
   isShuttingDown?: () => boolean;
 }
 
@@ -31,6 +37,8 @@ function asyncRoute(handler: (req: AuthenticatedRequest, res: Response) => Promi
 }
 
 export function bridgeStoreStatus(error: BridgeStoreError): number {
+  if (error.code === 'WORKSPACE_QUEUE_TIMEOUT') return 503;
+  if (error.code === 'WORKER_QUEUE_FULL') return 429;
   if (error.code === 'WORKER_UNAUTHORIZED') return 403;
   if (error.code === 'ASSIGNMENT_INVALID') return 400;
   if (error.code === 'RESULT_INVALID') return 502;
@@ -42,14 +50,21 @@ export function bridgeStoreStatus(error: BridgeStoreError): number {
 }
 
 export function createWorkspaceToolsRouter(options: WorkspaceToolsRouterOptions): Router {
+  const queueBudgetMs = options.queueTimeoutMs ?? 30_000;
+  if (!Number.isSafeInteger(queueBudgetMs) || queueBudgetMs < 1 || queueBudgetMs > 30_000) {
+    throw new RangeError('Workspace queue timeout must be between 1 and 30000 milliseconds');
+  }
+  if (options.timeoutMs !== undefined && (
+    !Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 1
+  )) {
+    throw new RangeError('Workspace execution timeout must be a positive safe integer');
+  }
   const router = Router();
 
   router.post(
     '/workspace-tools/execute',
     asyncRoute(async (req, res) => {
       const outcome = getWorkspaceToolOutcome(res);
-      const deadlineBudgetMs = Math.max(1, options.timeoutMs ?? 30_000);
-      outcome.deadlineBudgetMs = deadlineBudgetMs;
       const principal = getPrincipalOrReject(req, res);
       if (!principal) {
         outcome.errorCode = 'UNAUTHENTICATED';
@@ -68,6 +83,26 @@ export function createWorkspaceToolsRouter(options: WorkspaceToolsRouterOptions)
         return;
       }
       outcome.operation = req.body.operation;
+      const principalRequest: WorkspaceToolRequest = req.body.workspaceInstanceId == null
+        ? req.body
+        : {
+            ...req.body,
+            workspaceInstanceId: principalWorkspaceInstanceId({
+              instanceId: req.body.workspaceInstanceId,
+              tenantId: principal.tenantId,
+              principalId: principal.userId,
+            }),
+          };
+      const request: WorkspaceToolRequest = principalRequest.operation === 'execute_command'
+        ? { ...principalRequest, timeoutMs: Math.min(
+          principalRequest.timeoutMs ?? BRIDGE_WORKSPACE_COMMAND_DEFAULT_TIMEOUT_MS,
+          options.timeoutMs ?? Number.MAX_SAFE_INTEGER,
+        ) }
+        : principalRequest;
+      const executionBudgetMs = request.operation === 'execute_command'
+        ? request.timeoutMs! + 5_000
+        : Math.min(options.timeoutMs ?? 30_000, 30_000);
+      outcome.deadlineBudgetMs = queueBudgetMs + executionBudgetMs;
 
       let selection: { workerId: string; explicit: boolean } | undefined;
       try {
@@ -110,8 +145,9 @@ export function createWorkspaceToolsRouter(options: WorkspaceToolsRouterOptions)
           tenantId: principal.tenantId,
           requireTenantBinding:
             selection.explicit && (options.dynamicWorkers || selection.workerId !== options.configuredWorkerId),
-          request: req.body,
-          deadlineAtMs: Date.now() + deadlineBudgetMs,
+          request,
+          deadlineAtMs: Date.now() + queueBudgetMs,
+          executionTimeoutMs: executionBudgetMs,
           signal: controller.signal,
         }).finally(() => {
           outcome.dispatchDurationMs = Math.round(performance.now() - dispatchStartedAt);
@@ -148,6 +184,7 @@ export function createWorkspaceToolsRouter(options: WorkspaceToolsRouterOptions)
       } catch (error) {
         if (error instanceof BridgeStoreError) {
           outcome.errorCode = error.code;
+          if (error.code === 'WORKSPACE_QUEUE_TIMEOUT') res.setHeader('Retry-After', '1');
           res.status(bridgeStoreStatus(error)).json({
             error: error.message,
             code: error.code,

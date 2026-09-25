@@ -108,14 +108,14 @@ Deployments should pin a [tagged release](https://github.com/LibreChat-AI/code-i
 rather than track `main`, which moves whenever an internal snapshot is merged:
 
 ```bash
-git clone --branch v2.0.0 --depth 1 https://github.com/LibreChat-AI/code-interpreter.git
+git clone --branch v1.0.0 --depth 1 https://github.com/LibreChat-AI/code-interpreter.git
 ```
 
 Every release attaches `codeapi-<chart version>.tgz`, the packaged Helm chart
 with its Redis and MinIO subcharts vendored:
 
 ```bash
-helm install codeapi ./codeapi-0.3.0.tgz -f my-values.yaml
+helm install codeapi ./codeapi-0.3.1.tgz -f my-values.yaml
 ```
 
 Versions are `vMAJOR.MINOR.PATCH`, with `-rcN` release candidates published as
@@ -126,8 +126,10 @@ cut.
 
 Copy `.env.example` to `.env` and set `CODEAPI_BRIDGE_TOKEN` to a private value
 of at least 32 bytes (generate one with `openssl rand -hex 32`). The API exposes
-bridge routes even with the default HTTP sandbox backend, so hardened mode
-requires this enrollment credential. Compose defaults to
+bridge routes when configured through the remote-bridge backend, paired auth,
+dynamic workers, or a bridge token. Hardened deployments with none of these
+configured leave bridge routes disabled and do not require a bridge token.
+Enabled bridges still require this enrollment credential. Compose defaults to
 `CODEAPI_BRIDGE_AUTH_MODE=paired` and `CODEAPI_BRIDGE_DYNAMIC_WORKERS=true`.
 To restrict pairing to a fixed worker, set `CODEAPI_BRIDGE_DYNAMIC_WORKERS=false`
 and `CODEAPI_BRIDGE_WORKER_ID` to its ID. Keep the token outside workspaces and

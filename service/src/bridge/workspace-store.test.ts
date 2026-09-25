@@ -77,6 +77,225 @@ test('dispatches a workspace tool only to a worker advertising its workspace and
   });
 });
 
+for (const finalizationFails of [false, true]) test(`single-slot programmatic finalization retains the workspace fence (failure=${finalizationFails})`, async () => {
+  await store.register({
+    protocolVersion: BRIDGE_PROTOCOL_VERSION,
+    workerId: 'workspace-worker',
+    incarnationId,
+    capabilities: {
+      statefulWorkspace: false,
+      sandboxProfile: 'anthropic-srt',
+      runtimes: [],
+      workspaceTools: {
+        protocolVersion: BRIDGE_PROTOCOL_VERSION,
+        operations: ['execute_command'],
+        programmaticLanguages: ['bash'],
+        workspaces: [{ id: 'primary' }],
+      },
+    },
+  });
+  const body = {
+    language: 'bash',
+    version: '5.2',
+    session_id: 'session-1',
+    files: [{ name: 'main.sh', content: 'echo ready' }],
+  };
+  const completion = store.dispatch({
+    workerId: 'workspace-worker',
+    body,
+    headers: {},
+    workspaceId: 'primary',
+    deadlineAtMs: Date.now() + 5_000,
+    signal: new AbortController().signal,
+    finalize: async settlement => {
+      if (finalizationFails) throw new Error('artifact restoration failed');
+      return settlement;
+    },
+  });
+
+  const assignment = await store.lease('workspace-worker', incarnationId, 1_000);
+  expect(assignment).toMatchObject({
+    executionKind: 'workspace_programmatic',
+    workspaceId: 'primary',
+    request: { body },
+  });
+  await store.settle('workspace-worker', assignment?.assignmentId ?? '', {
+    protocolVersion: BRIDGE_PROTOCOL_VERSION,
+    generation: assignment?.generation ?? 0,
+    leaseToken: assignment?.leaseToken ?? '',
+    incarnationId,
+    status: 'fulfilled',
+    result: {
+      session_id: 'session-1',
+      language: 'bash',
+      version: '5.2',
+      files: [],
+      run: {
+        stdout: 'ready\n',
+        stderr: '',
+        code: 0,
+        signal: null,
+        output: 'ready\n',
+        memory: null,
+        message: null,
+        status: null,
+        cpu_time: null,
+        wall_time: 0.01,
+      },
+    },
+  });
+
+  if (finalizationFails) {
+    await expect(completion).rejects.toThrow('artifact restoration failed');
+    await expect(store.dispatch({ workerId: 'workspace-worker', body, headers: {},
+      workspaceId: 'primary', deadlineAtMs: Date.now() + 1000,
+      signal: new AbortController().signal,
+    })).rejects.toMatchObject({ code: 'WORKSPACE_QUARANTINED' });
+    return;
+  }
+  await expect(completion).resolves.toMatchObject({
+    status: 'fulfilled',
+    result: { session_id: 'session-1' },
+  });
+});
+
+test('rejects programmatic execution without the workspace capability', async () => {
+  await store.register({
+    protocolVersion: BRIDGE_PROTOCOL_VERSION,
+    workerId: 'workspace-worker',
+    incarnationId,
+    capabilities: {
+      statefulWorkspace: false,
+      sandboxProfile: 'anthropic-srt',
+      runtimes: [],
+      workspaceTools: {
+        protocolVersion: BRIDGE_PROTOCOL_VERSION,
+        operations: ['execute_command'],
+        workspaces: [{ id: 'primary' }],
+      },
+    },
+  });
+
+  await expect(
+    store.dispatch({
+      workerId: 'workspace-worker',
+      body: {
+        language: 'bash',
+        version: '5.2',
+        session_id: 'session-2',
+        files: [{ name: 'main.sh', content: 'echo denied' }],
+      },
+      headers: {},
+      workspaceId: 'primary',
+      deadlineAtMs: Date.now() + 1_000,
+      signal: new AbortController().signal,
+    }),
+  ).rejects.toMatchObject({ code: 'WORKER_MISMATCH' });
+  expect(await redis.keys('codeapi:bridge:v1:assignment:*')).toHaveLength(0);
+});
+
+test('drains an acknowledged workspace mutation cancellation before releasing it', async () => {
+  await store.register({
+    protocolVersion: BRIDGE_PROTOCOL_VERSION,
+    workerId: 'workspace-worker',
+    incarnationId,
+    capabilities: {
+      statefulWorkspace: false,
+      sandboxProfile: 'native-srt',
+      runtimes: [],
+      workspaceTools: {
+        protocolVersion: BRIDGE_PROTOCOL_VERSION,
+        operations: ['execute_command'],
+        workspaces: [{ id: 'primary' }],
+      },
+    },
+  });
+  const controller = new AbortController();
+  const completion = store.dispatchWorkspaceTool({
+    workerId: 'workspace-worker',
+    request: {
+      protocolVersion: BRIDGE_PROTOCOL_VERSION,
+      operation: 'execute_command',
+      workspaceId: 'primary',
+      command: 'sleep 30; touch delayed.txt',
+    },
+    deadlineAtMs: Date.now() + 5_000,
+    executionTimeoutMs: 500,
+    signal: controller.signal,
+  });
+  const assignment = (await store.lease(
+    'workspace-worker',
+    incarnationId,
+    1_000,
+  ))!;
+  await store.acknowledgeLease(
+    'workspace-worker',
+    incarnationId,
+    assignment.assignmentId,
+    assignment.generation,
+    assignment.leaseToken,
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  controller.abort();
+  for (
+    let attempt = 0;
+    attempt < 100 &&
+    !(await store.cancelled(
+      'workspace-worker',
+      incarnationId,
+      assignment.assignmentId,
+    ));
+    attempt += 1
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  expect(Date.now()).toBeGreaterThan(Date.parse(assignment.expiresAt));
+  await store.settle('workspace-worker', assignment.assignmentId, {
+    protocolVersion: BRIDGE_PROTOCOL_VERSION,
+    generation: assignment.generation,
+    leaseToken: assignment.leaseToken,
+    incarnationId,
+    status: 'rejected',
+    errorCode: 'EXECUTION_ABORTED',
+    error: 'Workspace command execution aborted',
+  });
+
+  await expect(completion).resolves.toMatchObject({
+    status: 'rejected',
+    errorCode: 'EXECUTION_ABORTED',
+  });
+
+  const reuse = store.dispatchWorkspaceTool({
+    workerId: 'workspace-worker',
+    request: {
+      protocolVersion: BRIDGE_PROTOCOL_VERSION,
+      operation: 'execute_command',
+      workspaceId: 'primary',
+      command: 'printf reused',
+    },
+    deadlineAtMs: Date.now() + 5_000,
+    executionTimeoutMs: 5_000,
+    signal: new AbortController().signal,
+  });
+  const next = (await store.lease(
+    'workspace-worker',
+    incarnationId,
+    1_000,
+  ))!;
+  expect(next.request).toMatchObject({ command: 'printf reused' });
+  await store.settle('workspace-worker', next.assignmentId, {
+    protocolVersion: BRIDGE_PROTOCOL_VERSION,
+    generation: next.generation,
+    leaseToken: next.leaseToken,
+    incarnationId,
+    status: 'rejected',
+    error: 'fixture completion',
+  });
+  await expect(reuse).resolves.toMatchObject({ status: 'rejected' });
+});
+
 test('rejects a workspace tool that the selected worker did not advertise', async () => {
   await store.register({
     protocolVersion: BRIDGE_PROTOCOL_VERSION,

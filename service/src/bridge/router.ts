@@ -7,6 +7,7 @@ import type { BridgePrincipalType, BridgeWorkerBinding } from './pairing';
 import type { CodeBridgeAssignment, CodeBridgeSettlement } from './store';
 
 import {
+  BRIDGE_WORKSPACE_COMMAND_MAX_TIMEOUT_MS,
   BRIDGE_PROTOCOL_VERSION,
   isValidBridgeWorkerCapabilities,
   isValidBridgeWorkerId,
@@ -29,12 +30,14 @@ const PRINCIPAL_TYPES = new Set<BridgePrincipalType>([
 export type BridgeAuthMode = 'static' | 'paired';
 
 export interface BridgeRouterOptions {
+  enabled?: boolean;
   store: RedisBridgeStore;
   pairings: RedisBridgePairingStore;
   authMode: BridgeAuthMode;
   adminToken: string;
   configuredWorkerId?: string;
   allowDynamicWorkers?: boolean;
+  maxCommandTimeoutMs?: number;
 }
 
 function sameToken(left: string, right: string): boolean {
@@ -130,6 +133,17 @@ function isSettlement(value: unknown): value is CodeBridgeSettlement {
 
 export function createBridgeRouter(options: BridgeRouterOptions): Router {
   const router = Router();
+  if (options.enabled === false) return router;
+  if (
+    options.maxCommandTimeoutMs !== undefined &&
+    (!Number.isSafeInteger(options.maxCommandTimeoutMs) || options.maxCommandTimeoutMs < 1)
+  ) {
+    throw new RangeError('Workspace command timeout must be a positive safe integer');
+  }
+  const maxCommandTimeoutMs =
+    options.maxCommandTimeoutMs == null
+      ? undefined
+      : Math.min(options.maxCommandTimeoutMs, BRIDGE_WORKSPACE_COMMAND_MAX_TIMEOUT_MS);
 
   const configuredWorker = (workerId: string): boolean =>
     options.allowDynamicWorkers === true ||
@@ -322,10 +336,13 @@ export function createBridgeRouter(options: BridgeRouterOptions): Router {
         return;
       }
       const status = await options.store.workerStatus(workerId);
+      const supportsCommands =
+        status.capabilities?.workspaceTools?.operations.includes('execute_command') === true;
       res.json({
         protocolVersion: BRIDGE_PROTOCOL_VERSION,
         workerId,
         ...status,
+        ...(supportsCommands && maxCommandTimeoutMs != null ? { maxCommandTimeoutMs } : {}),
       });
     }),
   );
@@ -396,6 +413,9 @@ router.post(
         registrationGeneration,
         registeredAt: new Date().toISOString(),
         leaseTtlMs: 60_000,
+      workspaceLeaseSlots: options.store.workspaceLeaseCapacity(
+        registration.capabilities.workspaceLeaseSlots,
+      ),
         supportedWorkspaceToolOperations: [
           'read_file',
           'search_text',
@@ -409,6 +429,8 @@ router.post(
         supportedWorkspaceEditFileModes: ['single', 'batch'],
         supportedWorkspaceEditFileFeatures: ['expected_base_sha256'],
         supportedWorkspaceListFileFeatures: ['after_path'],
+        supportedWorkspaceProgrammaticLanguages: ['bash'],
+        supportedWorkspaceInstanceTypes: ['git_worktree'],
       });
     } catch (error) {
       if (error instanceof BridgeStoreError) {
@@ -529,7 +551,11 @@ router.post(
       body.protocolVersion !== BRIDGE_PROTOCOL_VERSION ||
       !validIncarnationId(body.incarnationId) ||
       !Number.isFinite(requestedWait) ||
-      requestedWait < 0
+      requestedWait < 0 ||
+      (body.workspaceLeaseSlot !== undefined &&
+        (!Number.isSafeInteger(body.workspaceLeaseSlot) ||
+          Number(body.workspaceLeaseSlot) < 0 ||
+          Number(body.workspaceLeaseSlot) >= 8))
     ) {
       res.status(400).json({ error: 'Invalid bridge lease request' });
       return;
@@ -557,6 +583,7 @@ router.post(
               | { identityId: string }
               | undefined
           )?.identityId,
+          body.workspaceLeaseSlot === undefined ? undefined : Number(body.workspaceLeaseSlot),
         );
         if (leaseController.signal.aborted) {
           if (assignment != null) await options.store.returnLease(assignment);
@@ -630,7 +657,11 @@ router.post(
 );
 
 router.post(
-  '/workers/:workerId/assignments/:assignmentId/settle',
+  [
+    '/workers/:workerId/assignments/:assignmentId/settle',
+    '/workers/:workerId/assignments/:assignmentId/quarantine',
+    '/workers/:workerId/assignments/:assignmentId/workspace-cleanup',
+  ],
   workerAuth,
   asyncRoute(async (req, res) => {
     const settlement = req.body as unknown;
@@ -644,7 +675,11 @@ router.post(
       req.once('aborted', abortSettlement);
       res.once('close', abortSettlement);
       try {
-        await options.store.settle(
+        if (req.path.endsWith('/workspace-cleanup')) {
+          await options.store.confirmWorkspaceCleanup(req.params.workerId, req.params.assignmentId,
+            settlement, settlementController.signal,
+            (res.locals.bridgeWorkerAuthorization as {identityId: string} | undefined)?.identityId);
+        } else await options.store.settle(
           req.params.workerId,
           req.params.assignmentId,
           settlement,
@@ -654,6 +689,7 @@ router.post(
               | { identityId: string }
               | undefined
           )?.identityId,
+          req.path.endsWith('/quarantine'),
         );
         if (!settlementController.signal.aborted) {
           res.json({

@@ -1,17 +1,38 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  bridgeArtifactMediaType,
   bridgeWorkerPath,
   comparePortableRelativePaths,
+  isBridgeWorkspaceProgrammaticRequest,
+  isSupportedBridgeArtifactName,
   isValidBridgeWorkerCapabilities,
   isValidBridgeWorkerId,
   isWorkspaceToolRequest,
   isWorkspaceToolResult,
+  workspaceIsolationKey,
 } from './protocol.js';
 import type {
   WorkspaceEditFileRequest,
   WorkspacePreviewEditRequest,
 } from './protocol.js';
+
+test('accepts gateway directory markers as artifacts', () => {
+  assert.equal(isSupportedBridgeArtifactName('.dirkeep'), true);
+  assert.equal(isSupportedBridgeArtifactName('nested/.dirkeep'), true);
+  assert.equal(isSupportedBridgeArtifactName('nested/.dirkeep.exe'), false);
+});
+
+test('rejects caller-supplied programmatic control payloads', () => {
+  for (const name of ['_ptc_pending_result.json', '_PTC_PENDING_RESULT.JSON', 'nested/_ptc_pending_result.json']) {
+    assert.equal(isBridgeWorkspaceProgrammaticRequest({
+      headers: {},
+      body: { language: 'bash', version: '5.2.0', session_id: 'session', files: [
+        { name: 'main.sh', content: 'true' }, { name, content: '{}' },
+      ] },
+    }), false);
+  }
+});
 
 const validSingleEditRequest: WorkspaceEditFileRequest = {
   protocolVersion: 1,
@@ -67,6 +88,19 @@ test('bridgeWorkerPath encodes worker-controlled path segments', () => {
   assert.equal(
     bridgeWorkerPath('vm/example worker'),
     '/bridge/workers/vm%2Fexample%20worker',
+  );
+});
+
+test('workspace isolation keys keep roots and instances in disjoint namespaces', () => {
+  const instanceId = 'a'.repeat(64);
+  assert.notEqual(
+    workspaceIsolationKey(`foo:git-worktree:${instanceId}`),
+    workspaceIsolationKey('foo', instanceId),
+  );
+  assert.equal(workspaceIsolationKey('foo'), 'foo');
+  assert.notEqual(
+    workspaceIsolationKey('foo'),
+    workspaceIsolationKey('workspace:foo'),
   );
 });
 
@@ -242,6 +276,20 @@ test('workspace file listing accepts only bounded portable requests and results'
     afterPath: 'src/app.ts',
   };
   assert.equal(isWorkspaceToolRequest(request), true);
+  assert.equal(
+    isWorkspaceToolRequest({
+      ...request,
+      workspaceInstanceId: 'a'.repeat(64),
+    }),
+    true,
+  );
+  assert.equal(
+    isWorkspaceToolRequest({
+      ...request,
+      workspaceInstanceId: 'conversation-1',
+    }),
+    false,
+  );
   assert.equal(
     isWorkspaceToolRequest({ ...request, path: '../outside' }),
     false,
@@ -576,7 +624,11 @@ test('workspace capabilities allow per-workspace operation restrictions', () => 
       operations: ['read_file', 'write_file'],
       workspaces: [
         { id: 'readonly', operations: ['read_file'] },
-        { id: 'writable', operations: ['read_file', 'write_file'] },
+        {
+          id: 'writable',
+          operations: ['read_file', 'write_file'],
+          workspaceInstances: ['git_worktree'],
+        },
       ],
     },
   };
@@ -591,4 +643,176 @@ test('workspace capabilities allow per-workspace operation restrictions', () => 
     }),
     false,
   );
+});
+
+test('workspace programmatic capability is closed to Bash command roots', () => {
+  const workspaceTools = {
+    protocolVersion: 1,
+    operations: ['execute_command'],
+    programmaticLanguages: ['bash'],
+    workspaces: [{ id: 'project-a' }],
+  };
+  assert.equal(
+    isValidBridgeWorkerCapabilities({
+      statefulWorkspace: false,
+      sandboxProfile: 'anthropic-srt',
+      runtimes: [],
+      workspaceTools,
+    }),
+    true,
+  );
+  assert.equal(
+    isValidBridgeWorkerCapabilities({
+      statefulWorkspace: false,
+      sandboxProfile: 'anthropic-srt',
+      runtimes: [],
+      workspaceTools: { ...workspaceTools, operations: ['read_file'] },
+    }),
+    false,
+  );
+  assert.equal(
+    isValidBridgeWorkerCapabilities({
+      statefulWorkspace: false,
+      sandboxProfile: 'anthropic-srt',
+      runtimes: [],
+      workspaceTools: { ...workspaceTools, programmaticLanguages: ['python'] },
+    }),
+    false,
+  );
+});
+
+test('workspace programmatic requests accept only stable input cache identities', () => {
+  const request = {
+    headers: {},
+    body: {
+      language: 'bash',
+      version: '5.2',
+      execution_id: 'execution_1',
+      replay_tool_count: 2,
+      max_output_files: 50,
+      max_output_file_bytes: 10_000_000,
+      session_id: 'session-1',
+      workspace_instance_id: 'a'.repeat(64),
+      files: [
+        { name: 'main.sh', content: 'echo ready' },
+        {
+          name: 'skills/example.txt',
+          id: 'file-1',
+          storage_session_id: 'storage-1',
+          input_cache_key: 'a'.repeat(64),
+        },
+      ],
+    },
+  };
+  assert.equal(isBridgeWorkspaceProgrammaticRequest(request), true);
+  assert.equal(
+    isBridgeWorkspaceProgrammaticRequest({
+      ...request,
+      body: { ...request.body, workspace_instance_id: '../escape' },
+    }),
+    false,
+  );
+  assert.equal(
+    isBridgeWorkspaceProgrammaticRequest({
+      ...request,
+      body: {
+        ...request.body,
+        files: [request.body.files[0], { ...request.body.files[1], input_cache_key: '../cache' }],
+      },
+    }),
+    false,
+  );
+  for (const body of [
+    { ...request.body, execution_id: '../execution' },
+    { ...request.body, replay_tool_count: -1 },
+    { ...request.body, replay_tool_count: 257 },
+    { ...request.body, max_output_files: -1 },
+    { ...request.body, max_output_files: 101 },
+    { ...request.body, max_output_file_bytes: 0 },
+    { ...request.body, max_output_file_bytes: 10 * 1024 * 1024 + 1 },
+  ]) {
+    assert.equal(
+      isBridgeWorkspaceProgrammaticRequest({ ...request, body }),
+      false,
+    );
+  }
+});
+
+test('workspace programmatic history can use the bounded replay aggregate budget', () => {
+  const history = 'h'.repeat(10 * 1024 * 1024 + 1);
+  const body = {
+    language: 'bash',
+    version: '5.2',
+    session_id: 'session-1',
+    files: [
+      { name: 'main.sh', content: 'echo ready' },
+      { name: '_ptc_history.json', content: history },
+    ],
+  };
+  assert.equal(isBridgeWorkspaceProgrammaticRequest({ headers: {}, body }), true);
+  assert.equal(
+    isBridgeWorkspaceProgrammaticRequest({
+      headers: {},
+      body: {
+        ...body,
+        files: [
+          { name: 'main.sh', content: history },
+          { name: '_ptc_history.json', content: '{}' },
+        ],
+      },
+    }),
+    false,
+  );
+});
+
+test('workspace programmatic requests reject non-canonical file paths', () => {
+  for (const name of ['./main.sh', 'scripts//main.sh', 'scripts/./main.sh', '.']) {
+    assert.equal(
+      isBridgeWorkspaceProgrammaticRequest({
+        headers: {},
+        body: {
+          language: 'bash',
+          version: '5.2',
+          session_id: 'session-1',
+          files: [
+            { name: 'main.sh', content: 'echo ready' },
+            { name, content: 'data' },
+          ],
+        },
+      }),
+      false,
+      name,
+    );
+  }
+});
+
+test('workspace programmatic requests reject ancestor-descendant input conflicts', () => {
+  for (const names of [
+    ['main.sh', 'main.sh/data.txt'],
+    ['main.sh', 'assets', 'assets/logo.png'],
+    ['main.sh', 'deep/path/file.txt', 'deep'],
+  ]) {
+    assert.equal(
+      isBridgeWorkspaceProgrammaticRequest({
+        headers: {},
+        body: {
+          language: 'bash',
+          version: '5.2',
+          session_id: 'session-1',
+          files: names.map(name => ({ name, content: 'data' })),
+        },
+      }),
+      false,
+      names.join(', '),
+    );
+  }
+});
+
+test('bridge artifact policy and media types match the hardened gateway contract', () => {
+  assert.equal(isSupportedBridgeArtifactName('reports/result.json'), true);
+  assert.equal(isSupportedBridgeArtifactName('preview.png'), true);
+  assert.equal(isSupportedBridgeArtifactName('model.bin'), false);
+  assert.equal(bridgeArtifactMediaType('preview.png'), 'image/png');
+  assert.equal(bridgeArtifactMediaType('reports/result.json'), 'application/json');
+  assert.equal(bridgeArtifactMediaType('Dockerfile'), 'application/octet-stream');
 });

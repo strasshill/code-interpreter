@@ -25,7 +25,7 @@ async function macOsStorage() {
 }
 
 export async function assertPrivateStorageAcl(
-  handle: FileHandle, path: string, directory = false,
+  handle: Pick<FileHandle, 'fd'>, path: string, directory = false,
 ): Promise<void> {
   if (process.platform === 'darwin') {
     (await macOsStorage()).verifyMacOsAcl(handle.fd, path, directory);
@@ -33,7 +33,10 @@ export async function assertPrivateStorageAcl(
 }
 
 /** Only application-owned files/directories may have their ACLs removed. */
-export async function removePrivateStorageAcl(handle: FileHandle, path: string): Promise<void> {
+export async function removePrivateStorageAcl(
+  handle: Pick<FileHandle, 'fd'>,
+  path: string,
+): Promise<void> {
   if (process.platform === 'darwin') {
     (await macOsStorage()).removeMacOsAcl(handle.fd, path);
   }
@@ -45,12 +48,15 @@ export async function removePrivateStorageAcl(handle: FileHandle, path: string):
  * links one component at a time so even intermediate link targets are checked.
  * Other local accounts cannot replace a checked entry: its parent is either
  * non-writable or sticky and the entry belongs to this account or root.
+ * Returns every traversed entry, including intermediate symlinks, so callers
+ * can also enforce containment restrictions without resolving those entries away.
  */
 export async function assertPrivateStorageAncestors(
   path: string,
   allowMissing = false,
-): Promise<void> {
+): Promise<string[]> {
   assertPrivateStorageSupported();
+  const visited: string[] = [];
   const uid = process.getuid!();
   let current = '/';
   const pending = (isAbsolute(path) ? path : `${process.cwd()}/${path}`).split('/');
@@ -60,7 +66,8 @@ export async function assertPrivateStorageAncestors(
       if (allowMissing && error.code === 'ENOENT') return undefined;
       throw error;
     });
-    if (metadata === undefined) return;
+    if (metadata === undefined) return visited;
+    visited.push(current);
     if (metadata.uid !== uid && metadata.uid !== 0) {
       throw new BridgeProtocolError(
         `${current} is owned by another account (uid ${metadata.uid}), ` +
@@ -99,7 +106,7 @@ export async function assertPrivateStorageAncestors(
     }
     let next = pending.shift();
     while (next === '' || next === '.') next = pending.shift();
-    if (next === undefined) return;
+    if (next === undefined) return visited;
     current = next === '..' ? dirname(current) : `${current === '/' ? '' : current}/${next}`;
   }
 }
