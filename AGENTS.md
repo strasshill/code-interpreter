@@ -8,8 +8,9 @@ in this fork.
 ## Scope of work in this fork
 
 In scope:
-- `.github/workflows/publish-images.yml`, `.github/workflows/open-sync-pr.yml`,
-  `.github/workflows/release.yml` — build/publish/sync pipelines.
+- `.github/workflows/images.yml`, `.github/scripts/image-revision.sh`,
+  `.github/workflows/open-sync-pr.yml`, `.github/workflows/release.yml` —
+  build/publish/sync pipelines.
 - `docker/`, `docker-compose*.yml`, and the `Dockerfile*` files themselves,
   strictly for build/publish correctness (targets, platforms, tags, caching).
 - Local build validation before triggering GitHub Actions (see below).
@@ -29,7 +30,7 @@ flow; let the sync PR carry them.
 
 ## Workflow status
 
-Only `publish-images.yml` ("Publish Code Interpreter images") is active in
+Only `images.yml` ("Images") is active for image builds in
 this fork. `ci.yml` and `release.yml` are disabled manually via the GitHub
 API (repo Actions settings), not deleted — they stay in the tree so upstream
 sync diffs stay clean, but they never run here. `release.yml` also cuts
@@ -40,12 +41,16 @@ Don't re-enable `ci.yml`/`release.yml` as part of routine work in this fork.
 
 ## Image publish pipeline
 
-`publish-images.yml` runs on tag push (`v*`) or manual dispatch, and builds a
-matrix of images to `ghcr.io/<owner>/codeapi-<name>:<tag>`:
+`images.yml` runs on main pushes that change image inputs, relevant PRs, and
+manual dispatch. On main it publishes upstream's image set to
+`ghcr.io/<owner>/code-interpreter-<name>`, with immutable `sha-<commit>` tags
+and a `main` tag promoted after all images are available. PRs build without
+publishing:
 
-- `api` — `service/Dockerfile.api`, target `production`
-- `worker` — `service/Dockerfile.worker`, target `production`
-- `sandbox-runner` — `api/Dockerfile`, target `sandbox-runner-default`
+- `api` — `service/Dockerfile`, target `api`
+- `worker` — `service/Dockerfile`, target `worker`
+- `sandbox-runner` — `api/Dockerfile`, target `sandbox-runner-true`
+- `sandbox-runner-direct` — `api/Dockerfile`, target `sandbox-runner-false`
 - `file-server` — `service/Dockerfile`, target `production`
 - `tool-call-server` — `service/Dockerfile.tool-call-server`, target `production`
 - `egress-gateway` — `service/Dockerfile.egress-gateway`, target `production`
@@ -61,19 +66,19 @@ an ext4 rootfs image) — expect it to dominate total pipeline time.
 
 GitHub-hosted runners are slow/expensive for these builds and should be used
 to confirm a build that has already been validated locally, not to discover
-Dockerfile errors. Before pushing a tag or re-running `publish-images.yml`:
+Dockerfile errors. Before pushing a workflow change or re-running `images.yml`:
 
 ```
 docker compose -f docker-compose.local-dev.yml build sandbox
 ```
 
-This builds the same effective target as CI's `sandbox-runner` job
+This builds the same effective target as the `sandbox-runner` job
 (`api/Dockerfile`, target `sandbox-runner-${KVM_ENABLED:-true}`, which
-defaults to the same image `sandbox-runner-default` aliases to) using the
+defaults to `sandbox-runner-true`) using the
 local Docker Desktop engine. It builds for the host's native architecture
 only (no QEMU), so it validates Dockerfile/build-logic correctness fast, even
 though it isn't a byte-for-byte platform match with the amd64 CI build.
 
 For the other matrix images, build the equivalent target/Dockerfile pair
-directly with `docker buildx build -f <dockerfile> --target production .`
+directly with `docker buildx build -f <dockerfile> --target <target> .`
 before relying on CI.
